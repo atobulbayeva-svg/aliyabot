@@ -1,7 +1,11 @@
-"""Telegram-бот: на любое сообщение отвечает погодой в Астане и курсом биткоина.
+"""Telegram-бот: на любое сообщение отвечает сводкой по двум странам.
 
-Погода берётся из Open-Meteo (https://open-meteo.com), курс — из CoinGecko.
-Ключи API не нужны.
+Казахстан: время в Астане, погода в Астане, курс доллара к тенге (покупка/продажа).
+Грузия: время, погода в Батуми, курс доллара к лари, курс биткоина.
+
+Источники (ключи API не нужны):
+  погода: Open-Meteo, курс тенге: Halyk Bank, курс лари: Нацбанк Грузии,
+  биткоин: CoinGecko.
 Обновления получаем через long polling (getUpdates).
 """
 import os
@@ -19,9 +23,16 @@ if not TOKEN:
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
-ASTANA_TZ = timezone(timedelta(hours=5))  # UTC+5, перехода на летнее время нет
-BTC_URL ="https://api.coingecko.com/api/v3/simple/price"
+BTC_URL = "https://api.coingecko.com/api/v3/simple/price"
+HALYK_URL = "https://back.halykbank.kz/common/currency-history"
+NBG_URL = "https://nbg.gov.ge/gw/api/ct/monetarypolicy/currencies/en/json/"
+
+# Часовые пояса без перехода на летнее время
+KZ_TZ = timezone(timedelta(hours=5))   # Астана, UTC+5
+GE_TZ = timezone(timedelta(hours=4))   # Грузия, UTC+4
+
 ASTANA = {"latitude": 51.1694, "longitude": 71.4491}
+BATUMI = {"latitude": 41.6168, "longitude": 41.6367}
 
 # Расшифровка WMO-кодов погоды
 WMO = {
@@ -62,11 +73,16 @@ def wind_direction(deg: float) -> str:
     return DIRECTIONS[round(deg / 45) % 8]
 
 
-def get_weather_text() -> str:
+def time_text(tz: timezone, place: str) -> str:
+    now = datetime.now(tz)
+    return f"🕐 Время в {place}: {now:%H:%M}, {now:%d.%m.%Y}"
+
+
+def weather_text(coords: dict, place: str) -> str:
     resp = requests.get(
         WEATHER_URL,
         params={
-            **ASTANA,
+            **coords,
             "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
             "pressure_msl,wind_speed_10m,wind_direction_10m,weather_code",
             "wind_speed_unit": "ms",
@@ -79,7 +95,7 @@ def get_weather_text() -> str:
     description = WMO.get(c["weather_code"], "🌡 Погода")
     pressure_mm = c["pressure_msl"] * 0.75006  # гПа -> мм рт. ст.
     return (
-        "Погода в Астане сейчас\n"
+        f"Погода в {place} сейчас\n"
         f"{description}\n"
         f"🌡 Температура: {c['temperature_2m']:+.0f}°C "
         f"(ощущается как {c['apparent_temperature']:+.0f}°C)\n"
@@ -89,7 +105,30 @@ def get_weather_text() -> str:
     )
 
 
-def get_bitcoin_text() -> str:
+def usd_kzt_text() -> str:
+    """Курс доллара в Halyk Bank для физлиц (покупка и продажа банком)."""
+    resp = requests.get(HALYK_URL, timeout=10)
+    resp.raise_for_status()
+    rate = resp.json()["data"]["currencyHistory"][0]["privatePersons"]["USD/KZT"]
+    return (
+        "💵 Доллар к тенге (Halyk Bank)\n"
+        f"Покупка: {rate['buy']:.2f} ₸\n"
+        f"Продажа: {rate['sell']:.2f} ₸"
+    )
+
+
+def usd_gel_text() -> str:
+    """Официальный курс Нацбанка Грузии."""
+    resp = requests.get(NBG_URL, params={"currencies": "USD"}, timeout=10)
+    resp.raise_for_status()
+    usd = resp.json()[0]["currencies"][0]
+    return (
+        "💵 Доллар к лари (Нацбанк Грузии)\n"
+        f"1 $ = {usd['rate']:.4f} ₾"
+    )
+
+
+def bitcoin_text() -> str:
     resp = requests.get(
         BTC_URL,
         params={"ids": "bitcoin", "vs_currencies": "usd,kzt", "include_24hr_change": "true"},
@@ -99,27 +138,35 @@ def get_bitcoin_text() -> str:
     b = resp.json()["bitcoin"]
     change = b["usd_24h_change"]
     arrow = "📈" if change >= 0 else "📉"
-    return (
-        "Курс биткоина\n"
-        f"₿ {b['usd']:,.0f} $ ({b['kzt']:,.0f} ₸)\n".replace(",", " ")
-        + f"{arrow} За 24 часа: {change:+.1f}%"
-    )
+    price = f"₿ {b['usd']:,.0f} $ ({b['kzt']:,.0f} ₸)".replace(",", " ")
+    return f"Курс биткоина\n{price}\n{arrow} За 24 часа: {change:+.1f}%"
 
 
-def get_time_text() -> str:
-    now = datetime.now(ASTANA_TZ)
-    return f"🕐 Время в Астане: {now:%H:%M}, {now:%d.%m.%Y}"
+def safe(fetch, error: str) -> str:
+    """Один сбойный источник не должен ломать весь ответ."""
+    try:
+        return fetch()
+    except (requests.RequestException, KeyError, IndexError, ValueError) as e:
+        print(f"Ошибка ({error}):", e)
+        return f"Не удалось получить {error}, попробуйте чуть позже."
 
 
 def get_reply_text() -> str:
-    parts = [get_time_text()]
-    for fetch, error in ((get_weather_text, "погоду"), (get_bitcoin_text, "курс биткоина")):
-        try:
-            parts.append(fetch())
-        except (requests.RequestException, KeyError, ValueError) as e:
-            print(f"Ошибка получения: {error}:", e)
-            parts.append(f"Не удалось получить {error}, попробуйте чуть позже.")
-    return "\n\n".join(parts)
+    kazakhstan = [
+        "🇰🇿 КАЗАХСТАН",
+        time_text(KZ_TZ, "Астане"),
+        safe(lambda: weather_text(ASTANA, "Астане"), "погоду в Астане"),
+        safe(usd_kzt_text, "курс доллара к тенге"),
+    ]
+    georgia = [
+        "🇬🇪 ГРУЗИЯ",
+        time_text(GE_TZ, "Грузии"),
+        safe(lambda: weather_text(BATUMI, "Батуми"), "погоду в Батуми"),
+        safe(usd_gel_text, "курс доллара к лари"),
+        safe(bitcoin_text, "курс биткоина"),
+    ]
+    divider = "\n\n━━━━━━━━━━━━━━\n\n"
+    return divider.join(["\n\n".join(kazakhstan), "\n\n".join(georgia)])
 
 
 def send_message(chat_id: int, text: str) -> None:
@@ -130,8 +177,7 @@ def handle_update(update: dict) -> None:
     message = update.get("message")
     if not message:
         return
-    chat_id = message["chat"]["id"]
-    send_message(chat_id, get_reply_text())
+    send_message(message["chat"]["id"], get_reply_text())
 
 
 def skip_pending_updates() -> int | None:
