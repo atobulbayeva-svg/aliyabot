@@ -1,0 +1,11 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
